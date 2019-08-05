@@ -42,6 +42,8 @@ import org.apache.hadoop.hive.serde2.AbstractSerDe;
 import org.apache.hadoop.mapred.InputFormat;
 import org.apache.hadoop.mapred.JobConf;
 import org.apache.hadoop.mapred.OutputFormat;
+import org.apache.hadoop.mapreduce.Job;
+import org.apache.hadoop.mapreduce.filecache.DistributedCache;
 import org.apache.hadoop.security.UserGroupInformation;
 import org.apache.kafka.clients.CommonClientConfigs;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
@@ -53,6 +55,8 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.net.URI;
+import java.net.URISyntaxException;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -119,6 +123,21 @@ import java.util.function.Predicate;
     if (jobProperties.get(KafkaTableProperties.WRITE_SEMANTIC_PROPERTY.getName())
         .equals(KafkaOutputFormat.WriteSemantic.EXACTLY_ONCE.name())) {
       jobProperties.put("kafka.consumer.isolation.level", "read_committed");
+    }
+    String securityProtocol = tableDesc.getProperties().getProperty("kafka.consumer.security.protocol", "PLAINTEXT");
+    LOG.info("Testing if SSL is enabled: " + securityProtocol);
+    if (securityProtocol != null && securityProtocol.toUpperCase().equals("SSL")) {
+      LOG.info("Adding SSL Properties");
+      jobProperties.put("security.protocol", "SSL");
+      try {
+        importSslCredentialFileSecrets(tableDesc, jobProperties);
+        DistributedCache.addFileToClassPath( new Path(jobProperties.get(KafkaUtils.CONSUMER_CONFIGURATION_PREFIX + ".ssl.keystore.location")), configuration );
+      } catch (IOException e) {
+        throw new RuntimeException("Could not retrieve Kafka SSL credentials. " + e.getMessage());
+      }
+    }
+    for (String key : jobProperties.keySet()) {
+      LOG.info(key + ": " + jobProperties.get(key));
     }
   }
 
@@ -190,6 +209,37 @@ import java.util.function.Predicate;
           properties.put(key, entry.getValue());
         });
     return new KafkaStorageHandlerInfo(topic, properties);
+  }
+
+  private void importSslCredentialFileSecrets(TableDesc tableDesc, Map<String, String> jobProperties) throws IOException, URISyntaxException {
+
+    String sslCredentialFileLocation =
+            (String) tableDesc.getProperties().getProperty("hive.kafka.ssl.credential.storage.keystore.location");
+    String keystorePasswordField =
+            (String) tableDesc.getProperties().getProperty("hive.kafka.ssl.keystore.password");
+    String keystoreKeyPasswordField =
+            (String) tableDesc.getProperties().getProperty("hive.kafka.ssl.keystore.key.password.key");
+    String truststorePassowrdField =
+            (String) tableDesc.getProperties().getProperty("hive.kafka.ssl.truststore.password");
+    String keystorePassword = Utilities.getPasswdFromKeystore(sslCredentialFileLocation,
+            keystorePasswordField);
+    String keystoreKeyPassword = Utilities.getPasswdFromKeystore(sslCredentialFileLocation,
+            keystoreKeyPasswordField);
+    String truststorePassword = Utilities.getPasswdFromKeystore(sslCredentialFileLocation,
+            truststorePassowrdField);
+
+    String truststoreLocation = (String) tableDesc.getProperties().getProperty("ssl.truststore.location");
+    String keystoreLocation = (String) tableDesc.getProperties().getProperty("ssl.keystore.location");
+
+    // Should be hdfs://
+    Job job = Job.getInstance(this.configuration);
+    job.addCacheFile(new URI(truststoreLocation));
+    job.addCacheFile(new URI((String) tableDesc.getProperties().getProperty("ssl.truststore.location")));
+    jobProperties.put(KafkaUtils.CONSUMER_CONFIGURATION_PREFIX + ".ssl.keystore.location", (String) tableDesc.getProperties().getProperty("ssl.keystore.location"));
+    jobProperties.put(KafkaUtils.CONSUMER_CONFIGURATION_PREFIX + ".ssl.truststore.location", (String) tableDesc.getProperties().getProperty("ssl.truststore.location"));
+    jobProperties.put(KafkaUtils.CONSUMER_CONFIGURATION_PREFIX + ".ssl.keystore.password", keystorePassword);
+    jobProperties.put(KafkaUtils.CONSUMER_CONFIGURATION_PREFIX + ".ssl.key.password", keystoreKeyPassword);
+    jobProperties.put(KafkaUtils.CONSUMER_CONFIGURATION_PREFIX + ".ssl.truststore.password", truststorePassword);
   }
 
   private Properties buildProducerProperties(Table table) {
